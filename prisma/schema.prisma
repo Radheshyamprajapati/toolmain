@@ -1,0 +1,434 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Neon: use a pooled (PgBouncer) connection for the app at runtime and an
+  // unpooled direct connection for migrations. If you only have one Neon
+  // connection string, set both env vars to the same value.
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------- Enums ----------
+enum Role {
+  USER
+  TRADESMAN
+  ADMIN
+}
+
+// Verification state for a TRADESMAN who wants to operate as an
+// "Authorised Tool/Equipment Provider" on the platform.
+enum ProviderStatus {
+  NONE       // regular USER, not applicable
+  PENDING    // applied, waiting on admin review
+  APPROVED   // verified, can list tools/equipment
+  REJECTED   // application declined
+  SUSPENDED  // was approved, now suspended by admin
+}
+
+enum NotificationType {
+  BOOKING_CONFIRMED
+  BOOKING_REQUESTED
+  BOOKING_ACCEPTED
+  BOOKING_REJECTED
+  EXPIRY_REMINDER
+  EXPIRED
+  PAYMENT_RECEIVED
+  PAYMENT_FAILED
+  REFUND_ISSUED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  RETURN_REQUESTED
+  RETURN_CONFIRMED
+  PROVIDER_APPROVED
+  PROVIDER_REJECTED
+  RENTAL_CANCELLED
+}
+
+enum PushStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum TransactionType {
+  RENT
+  BUY
+}
+
+enum RentalStatus {
+  PENDING_PAYMENT
+  PAYMENT_SUCCESS
+  PENDING_VENDOR_ACCEPTANCE
+  ACCEPTED
+  PREPARING
+  READY
+  OUT_FOR_DELIVERY
+  ACTIVE
+  RETURN_REQUESTED
+  RETURNED
+  INSPECTION
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  SUCCESS
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum DeliveryStatus {
+  ASSIGNED
+  PICKED_UP
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  RETURN_PICKUP_SCHEDULED
+  RETURN_IN_TRANSIT
+  RETURN_COMPLETED
+  FAILED
+}
+
+enum DepositRefundStatus {
+  NONE
+  PENDING
+  REFUNDED
+  FORFEITED
+}
+
+enum CouponType {
+  PERCENT
+  FLAT
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  REJECTED
+}
+
+// ---------- Core Models ----------
+model User {
+  id       String  @id @default(cuid())
+  name     String
+  email    String  @unique
+  password String
+  role     Role    @default(USER)
+  phone    String?
+  location String?
+  avatar   String?
+
+  // Authorised Provider (tool/equipment owner) verification
+  providerStatus     ProviderStatus @default(NONE)
+  businessName       String?
+  gstNumber          String?
+  providerAppliedAt  DateTime?
+  providerReviewedAt DateTime?
+  providerNote       String?
+
+  tools            Tool[]
+  rentals          Rental[]
+  reviews          Review[]
+  favorites        Favorite[]
+  sentMessages     Message[]                  @relation("SentMessages")
+  receivedMessages Message[]                  @relation("ReceivedMessages")
+  conversations    ConversationParticipant[]
+  pushTokens       PushToken[]
+  disputesRaised   Dispute[]
+
+  isSuspended Boolean @default(false)
+
+  createdAt DateTime @default(now())
+}
+
+model Tool {
+  id          String  @id @default(cuid())
+  name        String
+  description String
+  category    String
+  pricePerDay Float
+  salePrice   Float?
+  image       String?
+  location    String
+  latitude    Float?
+  longitude   Float?
+  condition   String
+  isAvailable Boolean @default(true)
+  rating      Float   @default(0)
+
+  categoryGroup     String? // "TOOLS" | "INDUSTRIAL" | "EVENTS"
+  eventOccasion     String? // only for EVENTS
+  setSize           String? // e.g. "10ft x 8ft", "Large", "6-person setup"
+  includedItems     Json? // array of strings
+  requiredItems     Json? // array of strings
+  setupInstructions String? // multiline notes/steps
+  securityDeposit   Float   @default(0)
+
+  owner   User   @relation(fields: [ownerId], references: [id])
+  ownerId String
+
+  rentals   Rental[]
+  reviews   Review[]
+  favorites Favorite[]
+  images    ToolImage[]
+  blockedDates BlockedDate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+  @@index([categoryGroup, category])
+}
+
+// Owner-managed manual blocks (maintenance, offline booking, etc.) on top of
+// the automatic overlap check derived from existing rentals.
+model BlockedDate {
+  id        String   @id @default(cuid())
+  tool      Tool     @relation(fields: [toolId], references: [id])
+  toolId    String
+  startDate DateTime
+  endDate   DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@index([toolId, startDate, endDate])
+}
+
+model Coupon {
+  id             String     @id @default(cuid())
+  code           String     @unique
+  type           CouponType
+  value          Float
+  minOrderAmount Float      @default(0)
+  maxDiscount    Float?
+  maxUses        Int?
+  usedCount      Int        @default(0)
+  active         Boolean    @default(true)
+  expiresAt      DateTime?
+  createdAt      DateTime   @default(now())
+}
+
+model Dispute {
+  id             String        @id @default(cuid())
+  rentalId       String
+  raisedBy       User          @relation(fields: [raisedById], references: [id])
+  raisedById     String
+  reason         String
+  description    String
+  status         DisputeStatus @default(OPEN)
+  resolutionNote String?
+  resolvedAt     DateTime?
+  createdAt      DateTime      @default(now())
+
+  @@index([rentalId])
+  @@index([status])
+}
+
+model Rental {
+  id       String @id @default(cuid())
+  tool     Tool   @relation(fields: [toolId], references: [id])
+  toolId   String
+  renter   User   @relation(fields: [renterId], references: [id])
+  renterId String
+
+  transactionType TransactionType @default(RENT)
+
+  status            RentalStatus  @default(PENDING_PAYMENT)
+  paymentStatus     PaymentStatus @default(PENDING)
+  paymentIntentId   String? // Stripe PaymentIntent ID
+  checkoutSessionId String?       @unique // Stripe Checkout Session ID (lookup key)
+  paidAt            DateTime?
+  refundedAt        DateTime?
+  refundId          String?
+  refundAmount      Float? // partial refund tracking
+
+  rentalAmount    Float
+  deliveryFee     Float @default(0)
+  platformFee     Float @default(0)
+  securityDeposit Float @default(0)
+  couponCode      String?
+  discountAmount  Float @default(0)
+  totalAmount     Float
+
+  depositRefundStatus  DepositRefundStatus @default(NONE)
+  depositRefundedAt    DateTime?
+  depositRefundId      String?
+  depositForfeitReason String?
+
+  // Extension: a fresh Checkout Session is opened for just the extra amount;
+  // endDate only moves once the webhook confirms it was paid.
+  pendingExtensionEndDate    DateTime?
+  pendingExtensionAmount     Float?
+  pendingExtensionCheckoutId String?  @unique
+
+  pickupType      String? // "PICKUP" or "DELIVERY"
+  deliveryAddress String?
+  otpCode         String?
+  startDate       DateTime
+  endDate         DateTime
+  completedAt     DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  review          Review?
+
+  delivery Delivery?
+  history  RentalStatusHistory[]
+
+  createdAt DateTime @default(now())
+
+  @@index([toolId, startDate, endDate, status])
+  @@index([renterId])
+}
+
+model RentalStatusHistory {
+  id        String        @id @default(cuid())
+  rentalId  String
+  rental    Rental        @relation(fields: [rentalId], references: [id])
+  oldStatus RentalStatus?
+  newStatus RentalStatus
+  notes     String?
+  createdAt DateTime      @default(now())
+
+  @@index([rentalId])
+}
+
+// ---------- Delivery Partner Integration ----------
+// Represents a shipment handed off to a (real or simulated) third-party
+// logistics/delivery partner for a given rental (drop-off and/or pickup).
+model Delivery {
+  id       String @id @default(cuid())
+  rental   Rental @relation(fields: [rentalId], references: [id])
+  rentalId String @unique
+
+  partnerName    String // e.g. "Shadowfax Logistics", "Porter", "Dunzo"
+  partnerCode    String // internal code for the partner adapter, e.g. "SHADOWFAX"
+  trackingNumber String @unique
+  trackingUrl    String?
+  driverName     String?
+  driverPhone    String?
+  vehicleNumber  String?
+
+  status DeliveryStatus @default(ASSIGNED)
+
+  pickupAddress       String?
+  dropAddress         String?
+  estimatedPickupAt   DateTime?
+  estimatedDeliveryAt DateTime?
+  pickedUpAt          DateTime?
+  deliveredAt         DateTime?
+
+  // raw event log from the partner webhook / simulator, newest first
+  events Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------- Notification Models (no database relations) ----------
+model Notification {
+  id         String           @id @default(cuid())
+  userId     String
+  type       NotificationType
+  title      String
+  message    String
+  toolId     String?
+  rentalId   String?
+  read       Boolean          @default(false)
+  pushStatus PushStatus       @default(PENDING)
+  sentAt     DateTime?
+  dedupeKey  String?          @unique
+  createdAt  DateTime         @default(now())
+
+  @@index([userId, read])
+  @@index([userId, createdAt])
+}
+
+model PushToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// Reviews & Ratings
+model Review {
+  id        String   @id @default(cuid())
+  rentalId  String   @unique
+  rental    Rental   @relation(fields: [rentalId], references: [id])
+  toolId    String
+  tool      Tool     @relation(fields: [toolId], references: [id])
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  rating    Int // 1-5
+  comment   String?
+  createdAt DateTime @default(now())
+}
+
+// Favorites / Wishlist
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  toolId    String
+  tool      Tool     @relation(fields: [toolId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([userId, toolId])
+}
+
+// Chat / Messaging
+model Conversation {
+  id           String                     @id @default(cuid())
+  participants ConversationParticipant[]
+  messages     Message[]
+  createdAt    DateTime                   @default(now())
+  updatedAt    DateTime                   @updatedAt
+}
+
+model ConversationParticipant {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  userId         String
+  user           User         @relation(fields: [userId], references: [id])
+
+  @@unique([conversationId, userId])
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  senderId       String
+  sender         User         @relation("SentMessages", fields: [senderId], references: [id])
+  receiverId     String
+  receiver       User         @relation("ReceivedMessages", fields: [receiverId], references: [id])
+  content        String
+  read           Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+// Multi-image support
+model ToolImage {
+  id     String @id @default(cuid())
+  toolId String
+  tool   Tool   @relation(fields: [toolId], references: [id])
+  url    String
+  order  Int    @default(0)
+}
